@@ -802,6 +802,7 @@ struct openconnect_info {
 	char *sso_error_cookie;
 	char *sso_cookie_value;
 	char *sso_browser_mode;
+	int saml_login_port;		/* Port for SAML external browser listener (0 = disabled) */
 
 	int verbose;
 	void *cbdata;
@@ -1365,6 +1366,8 @@ int fortinet_obtain_cookie(struct openconnect_info *vpninfo);
 int fortinet_connect(struct openconnect_info *vpninfo);
 int fortinet_bye(struct openconnect_info *vpninfo, const char *reason);
 int fortinet_dtls_catch_svrhello(struct openconnect_info *vpninfo, struct pkt *pkt);
+int fortinet_sso_detect_done(struct openconnect_info *vpninfo, const struct oc_webview_result *result);
+int handle_fortinet_external_browser(struct openconnect_info *vpninfo);
 
 /* ppp.c */
 struct oc_ppp;
@@ -1676,6 +1679,9 @@ void openconnect_set_juniper(struct openconnect_info *vpninfo);
 
 /* hpke.c */
 int handle_external_browser(struct openconnect_info *vpninfo);
+#if defined(HAVE_POSIX_SPAWN) || defined(_WIN32)
+int spawn_browser(struct openconnect_info *vpninfo);
+#endif
 
 /* version.c */
 extern const char openconnect_version_str[];

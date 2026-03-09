@@ -388,6 +388,7 @@ static const struct vpn_proto openconnect_protos[] = {
 		.tcp_mainloop = ppp_tcp_mainloop,
 		.add_http_headers = fortinet_common_headers,
 		.obtain_cookie = fortinet_obtain_cookie,
+		.sso_detect_done = fortinet_sso_detect_done,
 		.secure_cookie = "SVPNCOOKIE",
 		.udp_protocol = "DTLS",
 #ifdef HAVE_DTLS
@@ -1860,7 +1861,7 @@ retry:
 		vpninfo->sso_cookie_value = NULL;
 		vpninfo->sso_username = NULL;
 
-		/* Handle the special Cisco external browser mode */
+		/* Handle external browser mode */
 		if (vpninfo->sso_browser_mode && !strcmp(vpninfo->sso_browser_mode, "external")) {
 			ret = handle_external_browser(vpninfo);
 		} else if (vpninfo->open_webview) {

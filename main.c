@@ -220,6 +220,7 @@ enum {
 	OPT_MULTICERT_CERT,
 	OPT_MULTICERT_KEY,
 	OPT_MULTICERT_KEY_PASSWORD,
+	OPT_SAML_LOGIN,
 };
 
 #ifdef __sun__
@@ -321,6 +322,7 @@ static const struct option long_options[] = {
 	OPTION("mca-certificate", 1, OPT_MULTICERT_CERT),
 	OPTION("mca-key", 1, OPT_MULTICERT_KEY),
 	OPTION("mca-key-password", 1, OPT_MULTICERT_KEY_PASSWORD),
+	OPTION("saml-login", 2, OPT_SAML_LOGIN),
 	OPTION(NULL, 0, 0)
 };
 
@@ -1036,6 +1038,7 @@ static void usage(void)
 	printf("  -g, --usergroup=GROUP           %s\n", _("Set path of initial request URL"));
 	printf("  -p, --key-password=PASS         %s\n", _("Set key passphrase or TPM SRK PIN"));
 	printf("      --external-browser=BROWSER  %s\n", _("Set external browser executable"));
+	printf("      --saml-login[=PORT]         %s\n", _("Force SAML login (default port 8020)"));
 	printf("      --key-password-from-fsid    %s\n", _("Key passphrase is fsid of file system"));
 	printf("      --token-mode=MODE           %s\n", _("Software token type: rsa, totp, hotp or oidc"));
 	printf("      --token-secret=STRING       %s\n", _("Software token secret or oidc token"));
@@ -1606,6 +1609,8 @@ static int autocomplete(int argc, char **argv)
 				break;
 			/* disable password autocomplete */
 			case OPT_MULTICERT_KEY_PASSWORD: /* --mca-key-password */
+				break;
+			case OPT_SAML_LOGIN: /* --saml-login */
 				break;
 			default:
 				fprintf(stderr, _("Unhandled autocomplete for option %d '--%s'. Please report.\n"),
@@ -2285,6 +2290,12 @@ int main(int argc, char *argv[])
 		case OPT_MULTICERT_KEY_PASSWORD:
 			free(vpninfo->certinfo[1].password);
 			vpninfo->certinfo[1].password = dup_config_arg();
+			break;
+		case OPT_SAML_LOGIN:
+			if (config_arg)
+				vpninfo->saml_login_port = atoi(config_arg);
+			else
+				vpninfo->saml_login_port = 8020;
 			break;
 		case OPT_SERVER:
 			server_url = keep_config_arg();

@@ -95,6 +95,372 @@ static int filter_opts(struct oc_text_buf *buf, const char *query, const char *i
 	return buf_error(buf);
 }
 
+/*
+ * Extract realm parameter from urlpath query string.
+ * Returns a strdup'd string, or NULL if not found.
+ */
+static char *extract_realm(const char *urlpath)
+{
+	char *r;
+
+	if (!urlpath)
+		return NULL;
+
+	for (r = strchr(urlpath, '?'); r && *++r; r = strchr(r, '&')) {
+		if (!strncmp(r, "realm=", 6)) {
+			const char *end = strchrnul(r + 1, '&');
+			return strndup(r + 6, end - r - 6);
+		}
+	}
+	return NULL;
+}
+
+/*
+ * SSO detect done callback for Fortinet SAML.
+ * The IdP redirects the browser to http://127.0.0.1:<port>/?id=<SESSION_ID>.
+ * We look for the ?id= parameter in the URI.
+ */
+int fortinet_sso_detect_done(struct openconnect_info *vpninfo,
+			     const struct oc_webview_result *result)
+{
+	const char *id;
+	int len;
+
+	if (!result->uri)
+		return -EAGAIN;
+
+	/* Look for ?id= or &id= in the URI */
+	id = strstr(result->uri, "?id=");
+	if (!id)
+		id = strstr(result->uri, "&id=");
+	if (!id)
+		return -EAGAIN;
+
+	id += 4; /* skip "?id=" or "&id=" */
+
+	/* Validate session_id: alphanumeric, hyphens, underscores, dots; max 1024 chars */
+	len = 0;
+	while (id[len] && id[len] != '&' && id[len] != '#' && len < 1024) {
+		if (!isalnum((unsigned char)id[len]) && id[len] != '-' &&
+		    id[len] != '_' && id[len] != '.') {
+			vpn_progress(vpninfo, PRG_ERR,
+				     _("Invalid character in SAML session ID\n"));
+			return -EINVAL;
+		}
+		len++;
+	}
+
+	if (len == 0) {
+		vpn_progress(vpninfo, PRG_ERR,
+			     _("Empty SAML session ID\n"));
+		return -EINVAL;
+	}
+
+	free(vpninfo->sso_cookie_value);
+	vpninfo->sso_cookie_value = strndup(id, len);
+	if (!vpninfo->sso_cookie_value)
+		return -ENOMEM;
+
+	vpn_progress(vpninfo, PRG_INFO,
+		     _("Got SAML session ID (%d bytes)\n"), len);
+	return 0;
+}
+
+/*
+ * Hard-coded HTTP responses for the local SAML listener
+ */
+static const char fortinet_saml_response_200[] =
+	"HTTP/1.1 200 OK\r\n"
+	"Connection: close\r\n"
+	"Content-Type: text/html\r\n\r\n"
+	"<html><title>SAML Login Success</title>"
+	"<body>SAML authentication complete. You may close this window.</body></html>\r\n";
+
+static const char fortinet_saml_response_404[] =
+	"HTTP/1.1 404 Not Found\r\n"
+	"Connection: close\r\n"
+	"Content-Type: text/html\r\n"
+	"Content-Length: 0\r\n\r\n";
+
+/*
+ * Local HTTP listener for Fortinet SAML external browser flow.
+ * FortiGate redirects the browser to http://127.0.0.1:<port>/?id=<SESSION_ID>
+ * after successful SAML authentication.
+ */
+int handle_fortinet_external_browser(struct openconnect_info *vpninfo)
+{
+	int ret = 0;
+	int port = vpninfo->saml_login_port ? vpninfo->saml_login_port : 8020;
+	int listen_fd, optval;
+	struct sockaddr_in6 sin6 = { };
+
+	sin6.sin6_family = AF_INET6;
+	sin6.sin6_port = htons(port);
+	sin6.sin6_addr = in6addr_loopback;
+#ifdef SOCK_CLOEXEC
+	listen_fd = socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
+	if (listen_fd < 0)
+#endif
+	listen_fd = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+	if (listen_fd < 0) {
+		char *errstr;
+	sockerr:
+#ifdef _WIN32
+		errstr = openconnect__win32_strerror(WSAGetLastError());
+#else
+		errstr = strerror(errno);
+#endif
+		vpn_progress(vpninfo, PRG_ERR,
+			     _("Failed to listen on local port %d: %s\n"),
+			     port, errstr);
+#ifdef _WIN32
+		free(errstr);
+#endif
+		if (listen_fd >= 0)
+			closesocket(listen_fd);
+		return -EIO;
+	}
+
+	optval = 1;
+	(void)setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, (void *)&optval, sizeof(optval));
+
+	if (bind(listen_fd, (void *)&sin6, sizeof(sin6)) < 0)
+		goto sockerr;
+
+	if (listen(listen_fd, 1))
+		goto sockerr;
+
+	if (set_sock_nonblock(listen_fd))
+		goto sockerr;
+
+	/* Now that we are listening on the socket, we can spawn the browser */
+	if (vpninfo->open_ext_browser) {
+		ret = vpninfo->open_ext_browser(vpninfo, vpninfo->sso_login, vpninfo->cbdata);
+#if defined(HAVE_POSIX_SPAWN) || defined(_WIN32)
+	} else if (vpninfo->external_browser) {
+		ret = spawn_browser(vpninfo);
+#endif
+	} else {
+		vpn_progress(vpninfo, PRG_ERR,
+			     _("No external browser configured for SAML login\n"));
+		ret = -EINVAL;
+		goto out;
+	}
+	if (ret) {
+		vpn_progress(vpninfo, PRG_ERR,
+			     _("Failed to spawn external browser for %s\n"),
+			     vpninfo->sso_login);
+		goto out;
+	}
+
+	/* Wait for the browser to redirect back with the session ID */
+	while (1) {
+		char line[4096];
+		char *id_param, *id, *end;
+		int accept_fd, id_len, valid, i;
+
+		accept_fd = cancellable_accept(vpninfo, listen_fd);
+		if (accept_fd < 0) {
+			ret = accept_fd;
+			goto out;
+		}
+		vpn_progress(vpninfo, PRG_TRACE,
+			     _("Accepted incoming SAML browser connection on port %d\n"),
+			     port);
+
+		ret = cancellable_gets(vpninfo, accept_fd, line, sizeof(line));
+		if (ret < 10 || strncmp(line, "GET /", 5) ||
+		    strncmp(line + ret - 9, " HTTP/1.", 8)) {
+			vpn_progress(vpninfo, PRG_TRACE,
+				     _("Invalid incoming SAML browser request\n"));
+			closesocket(accept_fd);
+			continue;
+		}
+
+		/* Null-terminate the request path */
+		line[ret - 9] = 0;
+
+		/* Look for ?id= in the request path */
+		id_param = strstr(line + 4, "?id=");
+		if (!id_param)
+			id_param = strstr(line + 4, "&id=");
+		if (!id_param) {
+			cancellable_send(vpninfo, accept_fd,
+					 fortinet_saml_response_404,
+					 sizeof(fortinet_saml_response_404) - 1);
+			closesocket(accept_fd);
+			continue;
+		}
+
+		id = id_param + 4;
+		/* Find end of session ID */
+		end = id;
+		while (*end && *end != '&' && *end != '#' && *end != ' ')
+			end++;
+
+		id_len = end - id;
+		if (id_len == 0 || id_len > 1024) {
+			vpn_progress(vpninfo, PRG_ERR,
+				     _("Invalid SAML session ID length: %d\n"), id_len);
+			cancellable_send(vpninfo, accept_fd,
+					 fortinet_saml_response_404,
+					 sizeof(fortinet_saml_response_404) - 1);
+			closesocket(accept_fd);
+			continue;
+		}
+
+		/* Validate session_id characters */
+		valid = 1;
+		for (i = 0; i < id_len; i++) {
+			if (!isalnum((unsigned char)id[i]) && id[i] != '-' &&
+			    id[i] != '_' && id[i] != '.') {
+				valid = 0;
+				break;
+			}
+		}
+		if (!valid) {
+			vpn_progress(vpninfo, PRG_ERR,
+				     _("Invalid characters in SAML session ID\n"));
+			cancellable_send(vpninfo, accept_fd,
+					 fortinet_saml_response_404,
+					 sizeof(fortinet_saml_response_404) - 1);
+			closesocket(accept_fd);
+			continue;
+		}
+
+		/* Consume remaining HTTP headers */
+		while (cancellable_gets(vpninfo, accept_fd, line, sizeof(line)) > 0)
+			;
+
+		/* Send success response */
+		cancellable_send(vpninfo, accept_fd,
+				 fortinet_saml_response_200,
+				 sizeof(fortinet_saml_response_200) - 1);
+		closesocket(accept_fd);
+
+		/* Store session ID */
+		free(vpninfo->sso_cookie_value);
+		vpninfo->sso_cookie_value = strndup(id, id_len);
+		if (!vpninfo->sso_cookie_value) {
+			ret = -ENOMEM;
+			goto out;
+		}
+
+		vpn_progress(vpninfo, PRG_INFO,
+			     _("Got SAML session ID from external browser (%d bytes)\n"),
+			     id_len);
+		ret = 0;
+		break;
+	}
+
+ out:
+	closesocket(listen_fd);
+	return ret;
+}
+
+/*
+ * Exchange a SAML session_id for an SVPNCOOKIE.
+ * GET /remote/saml/auth_id?id=<session_id> → server sets SVPNCOOKIE.
+ */
+static int fortinet_saml_exchange(struct openconnect_info *vpninfo,
+				  const char *session_id)
+{
+	char *resp_buf = NULL;
+	int ret;
+
+	free(vpninfo->urlpath);
+	if (asprintf(&vpninfo->urlpath, "remote/saml/auth_id?id=%s", session_id) < 0)
+		return -ENOMEM;
+
+	ret = do_https_request(vpninfo, "GET", NULL, NULL, &resp_buf, NULL, HTTP_REDIRECT);
+
+	/* Check if we got an SVPNCOOKIE */
+	struct oc_vpn_option *cookie;
+	for (cookie = vpninfo->cookies; cookie; cookie = cookie->next) {
+		if (!strcmp(cookie->option, "SVPNCOOKIE")) {
+			free(vpninfo->cookie);
+			if (asprintf(&vpninfo->cookie, "SVPNCOOKIE=%s", cookie->value) < 0) {
+				free(resp_buf);
+				return -ENOMEM;
+			}
+			vpn_progress(vpninfo, PRG_INFO,
+				     _("Got SVPNCOOKIE via SAML exchange\n"));
+			free(resp_buf);
+			return 0;
+		}
+	}
+
+	vpn_progress(vpninfo, PRG_ERR,
+		     _("SAML exchange did not return SVPNCOOKIE (HTTP status %d)\n"), ret);
+	free(resp_buf);
+	return -EPERM;
+}
+
+/*
+ * Perform the Fortinet SAML authentication flow:
+ * 1. Build the SAML start URL
+ * 2. Present SSO form to trigger webview or external browser
+ * 3. Exchange session_id for SVPNCOOKIE
+ */
+static int fortinet_saml_obtain_cookie(struct openconnect_info *vpninfo,
+				       const char *realm)
+{
+	int ret;
+
+	/* Build the SAML start URL */
+	free(vpninfo->sso_login);
+	if (realm && *realm) {
+		if (asprintf(&vpninfo->sso_login,
+			     "https://%s:%d/remote/saml/start?redirect=1&realm=%s",
+			     vpninfo->hostname, vpninfo->port, realm) < 0)
+			return -ENOMEM;
+	} else {
+		if (asprintf(&vpninfo->sso_login,
+			     "https://%s:%d/remote/saml/start?redirect=1",
+			     vpninfo->hostname, vpninfo->port) < 0)
+			return -ENOMEM;
+	}
+
+	vpn_progress(vpninfo, PRG_INFO,
+		     _("Starting Fortinet SAML authentication at %s\n"),
+		     vpninfo->sso_login);
+
+	if (vpninfo->open_webview) {
+		/* GUI/NM mode: open webview directly, bypassing process_auth_form.
+		 * The webview callback (open_webview) opens the SAML start URL,
+		 * the IdP redirects to http://127.0.0.1:<port>/?id=<SESSION_ID>,
+		 * and sso_detect_done (fortinet_sso_detect_done) extracts it. */
+		ret = vpninfo->open_webview(vpninfo, vpninfo->sso_login, vpninfo->cbdata);
+		if (ret)
+			return ret;
+
+		if (!vpninfo->sso_cookie_value) {
+			vpn_progress(vpninfo, PRG_ERR,
+				     _("No SAML session ID received\n"));
+			return -EINVAL;
+		}
+	} else {
+		/* CLI mode: use external browser with local HTTP listener */
+		ret = handle_fortinet_external_browser(vpninfo);
+		if (ret)
+			return ret;
+
+		if (!vpninfo->sso_cookie_value) {
+			vpn_progress(vpninfo, PRG_ERR,
+				     _("No SAML session ID received\n"));
+			return -EINVAL;
+		}
+	}
+
+	vpn_progress(vpninfo, PRG_DEBUG,
+		     _("Exchanging SAML session ID for SVPNCOOKIE\n"));
+
+	ret = fortinet_saml_exchange(vpninfo, vpninfo->sso_cookie_value);
+	free(vpninfo->sso_cookie_value);
+	vpninfo->sso_cookie_value = NULL;
+	return ret;
+}
+
 int fortinet_obtain_cookie(struct openconnect_info *vpninfo)
 {
 	int ret, ftmpush;
@@ -103,6 +469,19 @@ int fortinet_obtain_cookie(struct openconnect_info *vpninfo)
 	struct oc_form_opt *opt, *opt2;
 	char *resp_buf = NULL, *realm = NULL, *tokeninfo_fields = NULL, *ti;
 	char *js_top_location = NULL;
+
+	/* If --saml-login was specified, skip normal login and go straight to SAML */
+	if (vpninfo->saml_login_port) {
+		/* Fetch the initial page to get the realm */
+		ret = do_https_request(vpninfo, "GET", NULL, NULL, &resp_buf, NULL, HTTP_REDIRECT);
+		if (ret >= 0)
+			realm = extract_realm(vpninfo->urlpath);
+
+		ret = fortinet_saml_obtain_cookie(vpninfo, realm);
+		free(realm);
+		free(resp_buf);
+		return ret;
+	}
 
 	req_buf = buf_alloc();
 	if (buf_error(req_buf)) {
@@ -129,6 +508,7 @@ again:
 		char *location = strndup(js_top_location + top_location_str_len, js_top_location_end - js_top_location - top_location_str_len);
 
 		/* Skip leading / if necessary */
+		free(vpninfo->urlpath);
 		if (location && location[0] == '/') {
 			vpninfo->urlpath = strdup(location + 1);
 			free(location);
@@ -139,22 +519,75 @@ again:
 		goto again;
 	}
 
+	/* Auto-detect SAML: check if we got redirected to /remote/saml/start
+	 * or if the response contains SAML-related content */
+	if ((vpninfo->urlpath && strstr(vpninfo->urlpath, "remote/saml/")) ||
+	    (resp_buf && (strstr(resp_buf, "/remote/saml/start") ||
+			  strstr(resp_buf, "top.location=\"/remote/saml/")))) {
+		vpn_progress(vpninfo, PRG_INFO,
+			     _("Detected Fortinet SAML authentication\n"));
+		realm = extract_realm(vpninfo->urlpath);
+		ret = fortinet_saml_obtain_cookie(vpninfo, realm);
+		goto out;
+	}
+
+	/* Auto-detect SAML from login page: FortiGate includes a hidden field
+	 * <input type=hidden name=saml_login id=saml_login_id value="1">
+	 * when SAML is enabled. Parse with libxml2 to handle any quoting style. */
+	if (resp_buf) {
+		char *url = internal_get_url(vpninfo);
+		xmlDocPtr doc = htmlReadMemory(resp_buf, strlen(resp_buf), url, NULL,
+					       HTML_PARSE_RECOVER|HTML_PARSE_NOERROR|HTML_PARSE_NOWARNING|HTML_PARSE_NONET);
+		free(url);
+		if (doc) {
+			int saml_detected = 0;
+			xmlNode *root = xmlDocGetRootElement(doc);
+			/* Walk the entire document tree looking for the saml_login input */
+			for (xmlNode *node = root; node && !saml_detected; ) {
+				if (node->type == XML_ELEMENT_NODE &&
+				    xmlnode_is_named(node, "input")) {
+					char *name = NULL, *val = NULL;
+					if (!xmlnode_get_prop(node, "name", &name) &&
+					    !xmlnode_get_prop(node, "value", &val) &&
+					    name && !strcmp(name, "saml_login") &&
+					    val && !strcmp(val, "1")) {
+						saml_detected = 1;
+					}
+					free(name);
+					free(val);
+				}
+				/* Depth-first traversal */
+				if (node->children)
+					node = node->children;
+				else if (node->next)
+					node = node->next;
+				else {
+					while (node->parent && !node->parent->next)
+						node = node->parent;
+					node = node->parent ? node->parent->next : NULL;
+				}
+			}
+			xmlFreeDoc(doc);
+
+			if (saml_detected) {
+				vpn_progress(vpninfo, PRG_INFO,
+					     _("Detected SAML login support (saml_login=1) on FortiGate\n"));
+				realm = extract_realm(vpninfo->urlpath);
+				ret = fortinet_saml_obtain_cookie(vpninfo, realm);
+				goto out;
+			}
+		}
+	}
+
 	/* XX: Fortinet's initial 'GET /' normally redirects to /remote/login.
 	 * If a valid, non-default "realm" is specified (~= usergroup or authgroup),
 	 * it will appear as a query parameter of the resulting URL, and we need to
 	 * capture and save it. That is, for example:
 	 *   'GET /MyRealmName' will redirect to '/remote/login?realm=MyRealmName'
 	 */
-	if (vpninfo->urlpath) {
-		for (realm = strchr(vpninfo->urlpath, '?'); realm && *++realm; realm=strchr(realm, '&')) {
-			if (!strncmp(realm, "realm=", 6)) {
-				const char *end = strchrnul(realm+1, '&');
-				realm = strndup(realm+6, end-realm-6);
-				vpn_progress(vpninfo, PRG_INFO, _("Got login realm '%s'\n"), realm);
-				break;
-			}
-		}
-	}
+	realm = extract_realm(vpninfo->urlpath);
+	if (realm)
+		vpn_progress(vpninfo, PRG_INFO, _("Got login realm '%s'\n"), realm);
 
 	/* XX: Fortinet HTML forms *seem* like they should be about as easy to follow
 	 * as Juniper HTML forms, but some redirects use Javascript EXCLUSIVELY (no
