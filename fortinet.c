@@ -238,9 +238,29 @@ int fortinet_sso_detect_done(struct openconnect_info *vpninfo,
 static const char fortinet_saml_response_200[] =
 	"HTTP/1.1 200 OK\r\n"
 	"Connection: close\r\n"
-	"Content-Type: text/html\r\n\r\n"
-	"<html><title>SAML Login Success</title>"
-	"<body>SAML authentication complete. You may close this window.</body></html>\r\n";
+	"Content-Type: text/html; charset=utf-8\r\n\r\n"
+	"<!DOCTYPE html>\n"
+	"<html><head><title>VPN Connecting</title>\n"
+	"<style>\n"
+	"  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,\n"
+	"         sans-serif; display: flex; justify-content: center; align-items: center;\n"
+	"         min-height: 100vh; margin: 0; background: #f0f4f8; color: #333; }\n"
+	"  .card { background: #fff; border-radius: 12px; padding: 40px 48px;\n"
+	"         box-shadow: 0 2px 12px rgba(0,0,0,0.1); text-align: center;\n"
+	"         max-width: 400px; }\n"
+	"  h1 { font-size: 22px; margin: 16px 0 8px; font-weight: 600; }\n"
+	"  p { color: #666; font-size: 14px; margin: 0; }\n"
+	"  .icon { font-size: 48px; }\n"
+	"  .dots { color: #4a9; font-size: 24px; letter-spacing: 4px;\n"
+	"         margin: 12px 0; }\n"
+	"</style></head>\n"
+	"<body><div class='card'>\n"
+	"  <div class='icon'>&#x1F310;</div>\n"
+	"  <div class='dots'>&bull;&bull;&bull;&bull;&bull;&bull;&bull;</div>\n"
+	"  <h1>VPN Connecting</h1>\n"
+	"  <p>Your VPN connection has been redirected to OpenConnect.</p>\n"
+	"  <p>You may close this browser window now.</p>\n"
+	"</div></body></html>\n";
 
 static const char fortinet_saml_response_404[] =
 	"HTTP/1.1 404 Not Found\r\n"
