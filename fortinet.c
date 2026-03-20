@@ -35,6 +35,10 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdarg.h>
+#ifndef _WIN32
+#include <pthread.h>
+#include <poll.h>
+#endif
 
 /* clthello/svrhello strings for Fortinet DTLS initialization.
  * NB: C string literals implicitly add a final \0 (which is correct for these).
@@ -118,7 +122,22 @@ static char *extract_realm(const char *urlpath)
 /*
  * SSO detect done callback for Fortinet SAML.
  * The IdP redirects the browser to http://127.0.0.1:<port>/?id=<SESSION_ID>.
- * We look for the ?id= parameter in the URI.
+ *
+ * We must be careful about WHEN we return 0 (done).  In the webview flow,
+ * nm-openconnect-auth-dialog fires webkit_cookie_manager_get_cookies()
+ * asynchronously on each WEBKIT_LOAD_FINISHED.  Multiple async callbacks
+ * can be in flight.  When cookie_cb fires, result->uri is the CURRENT
+ * webview URI (re-read), while result->cookies are from the page that
+ * originally triggered the request.  So a "stale" callback from an IdP
+ * page can arrive after the webview navigated to 127.0.0.1 — with the
+ * loopback URI but IdP cookies.  If we match on that stale callback,
+ * nm-openconnect-auth-dialog signals done, but the NEXT (fresh) callback
+ * will access a dead context and crash.
+ *
+ * To avoid this, we additionally require that result->cookies is empty.
+ * Our local SAML listener serves a static success page with no cookies,
+ * so the "fresh" callback for the loopback page has no cookies.  Stale
+ * callbacks carry cookies from the IdP/FortiGate domain and are skipped.
  */
 int fortinet_sso_detect_done(struct openconnect_info *vpninfo,
 			     const struct oc_webview_result *result)
@@ -127,6 +146,19 @@ int fortinet_sso_detect_done(struct openconnect_info *vpninfo,
 	int len;
 
 	if (!result->uri)
+		return -EAGAIN;
+
+	/* Only match on loopback redirect URIs, not arbitrary IdP pages */
+	if (strncmp(result->uri, "http://127.0.0.1", 16) &&
+	    strncmp(result->uri, "http://localhost", 16) &&
+	    strncmp(result->uri, "http://[::1]", 12))
+		return -EAGAIN;
+
+	/* Skip stale async callbacks: they carry cookies from the IdP/FortiGate
+	 * page that originally triggered the request, while the webview has
+	 * already navigated to the loopback success page.  Our listener does
+	 * not set any cookies, so the fresh callback has an empty cookie list. */
+	if (result->cookies != NULL && result->cookies[0] != NULL)
 		return -EAGAIN;
 
 	/* Look for ?id= or &id= in the URI */
@@ -183,25 +215,22 @@ static const char fortinet_saml_response_404[] =
 	"Content-Length: 0\r\n\r\n";
 
 /*
- * Local HTTP listener for Fortinet SAML external browser flow.
- * FortiGate redirects the browser to http://127.0.0.1:<port>/?id=<SESSION_ID>
- * after successful SAML authentication.
+ * Create a listening socket on loopback for SAML redirect.
+ * Returns the listen_fd on success, or -EIO on error.
  */
-int handle_fortinet_external_browser(struct openconnect_info *vpninfo)
+static int create_saml_listener(struct openconnect_info *vpninfo, int port)
 {
-	int ret = 0;
-	int port = vpninfo->saml_login_port ? vpninfo->saml_login_port : 8020;
 	int listen_fd, optval;
-	struct sockaddr_in6 sin6 = { };
+	struct sockaddr_in sin4 = { };
 
-	sin6.sin6_family = AF_INET6;
-	sin6.sin6_port = htons(port);
-	sin6.sin6_addr = in6addr_loopback;
+	sin4.sin_family = AF_INET;
+	sin4.sin_port = htons(port);
+	sin4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 #ifdef SOCK_CLOEXEC
-	listen_fd = socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
+	listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
 	if (listen_fd < 0)
 #endif
-	listen_fd = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+	listen_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 	if (listen_fd < 0) {
 		char *errstr;
 	sockerr:
@@ -224,7 +253,7 @@ int handle_fortinet_external_browser(struct openconnect_info *vpninfo)
 	optval = 1;
 	(void)setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, (void *)&optval, sizeof(optval));
 
-	if (bind(listen_fd, (void *)&sin6, sizeof(sin6)) < 0)
+	if (bind(listen_fd, (void *)&sin4, sizeof(sin4)) < 0)
 		goto sockerr;
 
 	if (listen(listen_fd, 1))
@@ -232,6 +261,99 @@ int handle_fortinet_external_browser(struct openconnect_info *vpninfo)
 
 	if (set_sock_nonblock(listen_fd))
 		goto sockerr;
+
+	return listen_fd;
+}
+
+#ifndef _WIN32
+/*
+ * Background thread that listens on IPv4 127.0.0.1:<port> and accepts ONE
+ * HTTP connection, responding with a success page.  This is needed in webview
+ * (GUI) mode because the IdP redirects to http://127.0.0.1:<port>/?id=<SID>.
+ *
+ * We use a dedicated IPv4 socket because the redirect URL is explicitly
+ * http://127.0.0.1 (IPv4), and WebKit resolves it to 127.0.0.1 only —
+ * it won't connect to [::1].  The main create_saml_listener() uses IPv6
+ * which works for CLI browsers (they try both) but not for WebKit.
+ *
+ * Without this listener, WebKit gets "connection refused" and shows an
+ * error page, which can trigger additional load-changed events after auth
+ * completes — causing a use-after-free crash in nm-openconnect-auth-dialog.
+ */
+struct saml_listener_ctx {
+	int port;
+	volatile int should_stop;
+	int listen_fd;  /* set by thread after bind, -1 on failure */
+};
+
+static void *saml_listener_thread_func(void *arg)
+{
+	struct saml_listener_ctx *ctx = arg;
+	struct sockaddr_in sin4 = { };
+	int listen_fd, accept_fd, optval = 1;
+	struct pollfd pfd;
+	char buf[4096];
+
+	/* Create an IPv4 socket on 127.0.0.1 */
+	sin4.sin_family = AF_INET;
+	sin4.sin_port = htons(ctx->port);
+	sin4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+	listen_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (listen_fd < 0)
+		return NULL;
+
+	(void)setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR,
+			 (void *)&optval, sizeof(optval));
+
+	if (bind(listen_fd, (void *)&sin4, sizeof(sin4)) < 0 ||
+	    listen(listen_fd, 1) < 0) {
+		closesocket(listen_fd);
+		return NULL;
+	}
+
+	ctx->listen_fd = listen_fd;
+	pfd.fd = listen_fd;
+	pfd.events = POLLIN;
+
+	while (!ctx->should_stop) {
+		if (poll(&pfd, 1, 1000) <= 0)
+			continue;
+
+		accept_fd = accept(listen_fd, NULL, NULL);
+		if (accept_fd < 0)
+			break;
+
+		/* Consume the HTTP request */
+		recv(accept_fd, buf, sizeof(buf) - 1, 0);
+
+		/* Send success response so the webview shows a clean page
+		 * instead of a connection error */
+		send(accept_fd, fortinet_saml_response_200,
+		     sizeof(fortinet_saml_response_200) - 1, 0);
+		closesocket(accept_fd);
+		break;
+	}
+
+	closesocket(listen_fd);
+	return NULL;
+}
+#endif /* !_WIN32 */
+
+/*
+ * Local HTTP listener for Fortinet SAML external browser flow.
+ * FortiGate redirects the browser to http://127.0.0.1:<port>/?id=<SESSION_ID>
+ * after successful SAML authentication.
+ */
+int handle_fortinet_external_browser(struct openconnect_info *vpninfo)
+{
+	int ret = 0;
+	int port = vpninfo->saml_login_port ? vpninfo->saml_login_port : 8020;
+	int listen_fd;
+
+	listen_fd = create_saml_listener(vpninfo, port);
+	if (listen_fd < 0)
+		return listen_fd;
 
 	/* Now that we are listening on the socket, we can spawn the browser */
 	if (vpninfo->open_ext_browser) {
@@ -328,6 +450,16 @@ int handle_fortinet_external_browser(struct openconnect_info *vpninfo)
 			continue;
 		}
 
+		/* Store session ID before consuming headers — id points into
+		 * line[] which gets overwritten by cancellable_gets() below */
+		free(vpninfo->sso_cookie_value);
+		vpninfo->sso_cookie_value = strndup(id, id_len);
+		if (!vpninfo->sso_cookie_value) {
+			closesocket(accept_fd);
+			ret = -ENOMEM;
+			goto out;
+		}
+
 		/* Consume remaining HTTP headers */
 		while (cancellable_gets(vpninfo, accept_fd, line, sizeof(line)) > 0)
 			;
@@ -337,14 +469,6 @@ int handle_fortinet_external_browser(struct openconnect_info *vpninfo)
 				 fortinet_saml_response_200,
 				 sizeof(fortinet_saml_response_200) - 1);
 		closesocket(accept_fd);
-
-		/* Store session ID */
-		free(vpninfo->sso_cookie_value);
-		vpninfo->sso_cookie_value = strndup(id, id_len);
-		if (!vpninfo->sso_cookie_value) {
-			ret = -ENOMEM;
-			goto out;
-		}
 
 		vpn_progress(vpninfo, PRG_INFO,
 			     _("Got SAML session ID from external browser (%d bytes)\n"),
@@ -429,8 +553,33 @@ static int fortinet_saml_obtain_cookie(struct openconnect_info *vpninfo,
 		/* GUI/NM mode: open webview directly, bypassing process_auth_form.
 		 * The webview callback (open_webview) opens the SAML start URL,
 		 * the IdP redirects to http://127.0.0.1:<port>/?id=<SESSION_ID>,
-		 * and sso_detect_done (fortinet_sso_detect_done) extracts it. */
+		 * and sso_detect_done (fortinet_sso_detect_done) extracts it.
+		 *
+		 * We also start a local IPv4 HTTP listener so that the redirect
+		 * actually succeeds — without it, WebKit gets "connection refused"
+		 * and shows an error page, triggering additional load events
+		 * that can crash nm-openconnect-auth-dialog.  The listener
+		 * creates its own IPv4 socket (WebKit connects to 127.0.0.1,
+		 * not [::1]). */
+#ifndef _WIN32
+		pthread_t listener_tid;
+		struct saml_listener_ctx lctx = {
+			.port = vpninfo->saml_login_port ? vpninfo->saml_login_port : 8020,
+			.listen_fd = -1,
+		};
+		int listener_started = !pthread_create(&listener_tid, NULL,
+						       saml_listener_thread_func, &lctx);
+		/* Listener failure is non-fatal: webview still works,
+		 * just with the old "connection refused" behavior. */
+#endif
 		ret = vpninfo->open_webview(vpninfo, vpninfo->sso_login, vpninfo->cbdata);
+
+#ifndef _WIN32
+		if (listener_started) {
+			lctx.should_stop = 1;
+			pthread_join(listener_tid, NULL);
+		}
+#endif
 		if (ret)
 			return ret;
 
