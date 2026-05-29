@@ -2586,6 +2586,22 @@ int openconnect_init_ssl(void)
 	if (gnutls_global_init())
 		return -EIO;
 
+#if defined(HAVE_P11KIT)
+	/*
+	 * From the manual:
+	 * https://www.gnutls.org/reference/gnutls-pkcs11.html#gnutls-pkcs11-init
+	 *   You don't need to call this function since GnuTLS 3.3.0
+	 *   because it is being called during the first request
+	 *   PKCS 11 operation.
+	 *
+	 * However, this has proven to be incorrect in current releases:
+	 * https://gitlab.com/gnutls/gnutls/-/issues/1798
+	 */
+	if (gnutls_pkcs11_init(GNUTLS_PKCS11_FLAG_AUTO, NULL) < 0) {
+		/* Non-fatal: continue even if PKCS#11 init fails */
+	}
+#endif
+
 	return 0;
 }
 
