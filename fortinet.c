@@ -40,6 +40,8 @@
 #include <poll.h>
 #endif
 
+#include "local_overrides.h"
+
 /* clthello/svrhello strings for Fortinet DTLS initialization.
  * NB: C string literals implicitly add a final \0 (which is correct for these).
  */
@@ -570,7 +572,17 @@ static int fortinet_saml_obtain_cookie(struct openconnect_info *vpninfo,
 		     _("Starting Fortinet SAML authentication at %s\n"),
 		     vpninfo->sso_login);
 
-	if (vpninfo->open_webview) {
+	/* Per-host override: force external-browser path when the embedded
+	 * QtWebEngine view can't validate the gateway's self-signed cert
+	 * (e.g. FortiGate serial as CN, no SAN). */
+	int _force_ext_browser = 0;
+	{
+		struct local_override _ov;
+		if (vpninfo->hostname && local_overrides_lookup(vpninfo->hostname, &_ov))
+			_force_ext_browser = _ov.force_ext_browser;
+	}
+
+	if (vpninfo->open_webview && !_force_ext_browser) {
 		/* GUI/NM mode: open webview directly, bypassing process_auth_form.
 		 * The webview callback (open_webview) opens the SAML start URL,
 		 * the IdP redirects to http://127.0.0.1:<port>/?id=<SESSION_ID>,
@@ -635,6 +647,17 @@ int fortinet_obtain_cookie(struct openconnect_info *vpninfo)
 	char *resp_buf = NULL, *realm = NULL, *tokeninfo_fields = NULL, *ti;
 	char *js_top_location = NULL;
 	int js_redirects = 0;
+
+	/* Apply per-host overrides from /etc/openconnect/local-overrides.conf */
+	{
+		struct local_override _ov;
+		if (vpninfo->hostname && local_overrides_lookup(vpninfo->hostname, &_ov)) {
+			if (_ov.force_saml && !vpninfo->saml_login_port)
+				vpninfo->saml_login_port = FORTINET_SAML_DEFAULT_PORT;
+			if (_ov.disable_ipv6)
+				openconnect_disable_ipv6(vpninfo);
+		}
+	}
 
 	/* If --saml-login was specified, skip normal login and go straight to SAML */
 	if (vpninfo->saml_login_port) {
