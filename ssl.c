@@ -324,7 +324,12 @@ int connect_https_socket(struct openconnect_info *vpninfo)
 		char port[6];
 
 		memset(&hints, 0, sizeof(struct addrinfo));
-		hints.ai_family = AF_UNSPEC;
+		/* Fork extension: when disable_ipv6 is set (via the existing
+		 * --disable-ipv6 flag or our local-overrides framework), also
+		 * skip AAAA records on the outer gateway resolution. Lets
+		 * dual-stack-DNS gateways with IPv4-only listening sockets
+		 * work without an /etc/hosts override. */
+		hints.ai_family = vpninfo->disable_ipv6 ? AF_INET : AF_UNSPEC;
 		hints.ai_socktype = SOCK_STREAM;
 		hints.ai_flags = AI_PASSIVE | AI_NUMERICSERV;
 		hints.ai_protocol = 0;
